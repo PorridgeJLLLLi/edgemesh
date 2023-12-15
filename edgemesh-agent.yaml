@@ -1,0 +1,14 @@
+modules:
+  edgeDNS:
+    enable: true
+  edgeProxy:
+    enable: true
+  edgeTunnel:
+    enable: true
+    psk:
+      enable: false
+      path: /etc/edgemesh/psk
+    relayNodes:
+      - nodeName: zjl-master
+        advertiseAddress:
+          - 47.93.52.37

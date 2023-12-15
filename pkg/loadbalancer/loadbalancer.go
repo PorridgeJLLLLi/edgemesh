@@ -2,10 +2,13 @@ package loadbalancer
 
 import (
 	"fmt"
+	"github.com/pkg/errors"
 	"net"
 	"net/http"
+	"os"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -154,6 +157,87 @@ type LoadBalancer struct {
 	serviceChangesLock sync.Mutex
 	serviceChanges     map[types.NamespacedName]*serviceChange // map of service changes
 	syncRunner         asyncRunnerInterface                    // governs calls to syncProxyRules
+
+	ps *policyStatus
+}
+
+const (
+	policyStatusWatchInterval = 1 * time.Second
+	policyStatusFileName      = "policy.ok"
+)
+
+type policyStatus struct {
+	status  bool
+	svc2Edp map[proxy.ServicePortName]string
+	mLock   sync.RWMutex
+}
+
+func (ps *policyStatus) watch(stop <-chan struct{}) {
+	ticker := time.NewTicker(policyStatusWatchInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			ps.parseFile()
+		}
+	}
+}
+
+func (ps *policyStatus) parseFile() {
+	ps.mLock.Lock()
+	defer ps.mLock.Unlock()
+
+	b, err := os.ReadFile(policyStatusFileName)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			klog.Warningf("%s does not exist\n", policyStatusFileName)
+			ps.status = false
+			return
+		}
+		klog.ErrorS(err, "failed to read policy status file")
+		return
+	}
+
+	ps.status = true
+	source := string(b)
+	lines := strings.Split(source, "\n")
+	for _, line := range lines {
+		l := strings.TrimSpace(line)
+		if l == "" {
+			continue
+		}
+
+		kv := strings.Split(l, " ")
+		if len(kv) != 2 {
+			continue
+		}
+
+		key, value := kv[0], kv[1]
+		ks := strings.Split(key, ":")
+		if len(ks) != 3 {
+			continue
+		}
+		// only validate the format of endpoint
+		vs := strings.Split(value, ":")
+		if len(vs) != 4 {
+			continue
+		}
+
+		svcName, svcNamespace, svcPort := ks[0], ks[1], ks[2]
+		spn := proxy.ServicePortName{
+			NamespacedName: types.NamespacedName{
+				Namespace: svcNamespace,
+				Name:      svcName,
+			},
+			Port:     svcPort,
+			Protocol: "",
+		}
+		ps.svc2Edp[spn] = value
+		klog.Infof("update %v -> %v", spn, value)
+	}
 }
 
 func New(config *v1alpha1.LoadBalancer, kubeClient kubernetes.Interface, istioClient istio.Interface, syncPeriod time.Duration) *LoadBalancer {
@@ -167,7 +251,14 @@ func New(config *v1alpha1.LoadBalancer, kubeClient kubernetes.Interface, istioCl
 		services:       make(map[proxy.ServicePortName]*balancerState),
 		policyMap:      make(map[proxy.ServicePortName]Policy),
 		stopCh:         make(chan struct{}),
+
+		ps: &policyStatus{
+			status:  false,
+			svc2Edp: make(map[proxy.ServicePortName]string),
+			mLock:   sync.RWMutex{},
+		},
 	}
+	go lb.ps.watch(lb.stopCh)
 	lb.syncRunner = async.NewBoundedFrequencyRunner("sync-runner", lb.syncServices, time.Minute, syncPeriod, numBurstSyncs)
 	return lb
 }
@@ -835,6 +926,12 @@ func (lb *LoadBalancer) tryPickEndpoint(svcPort proxy.ServicePortName, sessionAf
 	return endpoint, req, true
 }
 
+/*
+Namespace="default"
+Name="hostname-lb-svc"
+Port="http-0"
+Protocol=""
+*/
 func (lb *LoadBalancer) nextEndpointWithConn(svcPort proxy.ServicePortName, srcAddr net.Addr, sessionAffinityReset bool,
 	netConn net.Conn, cliReq *http.Request) (string, *http.Request, error) {
 	// Coarse locking is simple. We can get more fine-grained if/when we
@@ -852,6 +949,15 @@ func (lb *LoadBalancer) nextEndpointWithConn(svcPort proxy.ServicePortName, srcA
 	klog.V(4).InfoS("NextEndpoint for service", "servicePortName", svcPort, "address", srcAddr, "endpoints", state.endpoints)
 
 	sessionAffinityEnabled := isSessionAffinity(&state.affinity)
+
+	lb.ps.mLock.RLock()
+	if lb.ps.status {
+		if endpoint, ok := lb.ps.svc2Edp[svcPort]; ok {
+			lb.ps.mLock.RUnlock()
+			return endpoint, cliReq, nil
+		}
+	}
+	lb.ps.mLock.RUnlock()
 
 	// Note: because loadBalance strategy may have read http.Request from inConn,
 	// so here we need to return it to outConn!
@@ -887,7 +993,7 @@ func (lb *LoadBalancer) nextEndpointWithConn(svcPort proxy.ServicePortName, srcA
 		var affinity *affinityState
 		affinity = state.affinity.affinityMap[ipaddr]
 		if affinity == nil {
-			affinity = new(affinityState) //&affinityState{ipaddr, "TCP", "", endpoint, time.Now()}
+			affinity = new(affinityState) // &affinityState{ipaddr, "TCP", "", endpoint, time.Now()}
 			state.affinity.affinityMap[ipaddr] = affinity
 		}
 		affinity.lastUsed = time.Now()
@@ -983,7 +1089,7 @@ func (lb *LoadBalancer) NewService(svcPort proxy.ServicePortName, affinityType v
 // This assumes that lb.lock is already held.
 func (lb *LoadBalancer) newServiceInternal(svcPort proxy.ServicePortName, affinityType v1.ServiceAffinity, ttlSeconds int) *balancerState {
 	if ttlSeconds == 0 {
-		ttlSeconds = int(v1.DefaultClientIPServiceAffinitySeconds) //default to 3 hours if not specified.  Should 0 be unlimited instead????
+		ttlSeconds = int(v1.DefaultClientIPServiceAffinitySeconds) // default to 3 hours if not specified.  Should 0 be unlimited instead????
 	}
 
 	if _, exists := lb.services[svcPort]; !exists {
